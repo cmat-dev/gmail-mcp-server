@@ -27,6 +27,20 @@ const SCOPES = [
 
 const tokenStore = new TokenStore();
 
+function formatAccountError(err: any): string {
+  const raw =
+    err?.response?.data?.error_description ??
+    err?.response?.data?.error ??
+    err?.message ??
+    String(err);
+
+  if (/invalid_grant/i.test(String(raw))) {
+    return "OAuth authorization is invalid or revoked. Re-authorize this account via /setup.";
+  }
+
+  return String(raw);
+}
+
 // ---------------------------------------------------------------------------
 // Gmail service factory — exchanges stored refresh token for access token
 // ---------------------------------------------------------------------------
@@ -138,7 +152,11 @@ function createMcpServer(): McpServer {
     },
     async ({ account, query, max_results }) => {
       const accounts = resolveAccounts(account);
-      const allResults: Array<{ account: string; emails: any[] }> = [];
+      const allResults: Array<{
+        account: string;
+        emails: any[];
+        error?: string;
+      }> = [];
 
       for (const email of accounts) {
         try {
@@ -149,6 +167,7 @@ function createMcpServer(): McpServer {
           allResults.push({
             account: email,
             emails: [],
+            error: formatAccountError(err),
           });
         }
       }
@@ -299,7 +318,11 @@ function createMcpServer(): McpServer {
     },
     async ({ account, query, max_results }) => {
       const accounts = resolveAccounts(account);
-      const allResults: Array<{ account: string; emails: any[] }> = [];
+      const allResults: Array<{
+        account: string;
+        emails: any[];
+        error?: string;
+      }> = [];
 
       for (const email of accounts) {
         try {
@@ -307,7 +330,11 @@ function createMcpServer(): McpServer {
           const emails = await gmail.batchProcess(query, max_results);
           allResults.push({ account: email, emails });
         } catch (err: any) {
-          allResults.push({ account: email, emails: [] });
+          allResults.push({
+            account: email,
+            emails: [],
+            error: formatAccountError(err),
+          });
         }
       }
 
