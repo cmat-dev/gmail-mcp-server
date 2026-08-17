@@ -1,10 +1,12 @@
 import express, { Request, Response, NextFunction } from "express";
+import { pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { google } from "googleapis";
 import { z } from "zod";
 import { GmailService } from "./gmail-service.js";
 import { TokenStore } from "./token-store.js";
+import { AdminAuth, AdminSession } from "./admin-auth.js";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -15,6 +17,8 @@ const SERVER_URL = process.env.SERVER_URL || `http://localhost:${PORT}`;
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID!;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET!;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD!;
+const SESSION_SECRET = process.env.SESSION_SECRET || process.env.ENCRYPTION_KEY!;
+const SECURE_SERVER = SERVER_URL.startsWith("https://");
 const SCOPES = [
   "https://www.googleapis.com/auth/gmail.readonly",
   "https://www.googleapis.com/auth/gmail.modify",
@@ -26,6 +30,15 @@ const SCOPES = [
 // ---------------------------------------------------------------------------
 
 const tokenStore = new TokenStore();
+const adminAuth = new AdminAuth({
+  adminPassword: ADMIN_PASSWORD,
+  sessionSecret: SESSION_SECRET,
+  secureCookie: SECURE_SERVER,
+});
+
+if (process.env.NODE_ENV === "production" && !SECURE_SERVER) {
+  throw new Error("SERVER_URL must use HTTPS in production");
+}
 
 function formatAccountError(err: any): string {
   const raw =
@@ -365,54 +378,151 @@ function createMcpServer(): McpServer {
 // Express app
 // ---------------------------------------------------------------------------
 
-const app = express();
+export const app = express();
+app.set("trust proxy", 1);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // ---------------------------------------------------------------------------
-// Admin auth middleware for /setup routes
+// Admin authentication and setup-page security
 // ---------------------------------------------------------------------------
 
-function requireAdmin(req: Request, res: Response, next: NextFunction): void {
-  const key =
-    req.query.key as string | undefined ??
-    req.headers["x-admin-key"] as string | undefined;
+function escapeHtml(value: unknown): string {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
 
-  if (key !== ADMIN_PASSWORD) {
-    res.status(401).send(`
-      <html><body style="font-family:system-ui;max-width:400px;margin:80px auto;text-align:center">
-        <h2>Admin Login</h2>
-        <form method="GET">
-          <input type="password" name="key" placeholder="Admin password" style="padding:8px;width:100%;box-sizing:border-box;margin-bottom:12px" />
-          <button type="submit" style="padding:8px 24px">Login</button>
-        </form>
-      </body></html>
-    `);
+function setupUrl(message?: string): string {
+  return message ? `/setup?message=${encodeURIComponent(message)}` : "/setup";
+}
+
+function sendLoginPage(res: Response, status = 401, message?: string): void {
+  res.status(status).send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Gmail MCP - Admin Login</title>
+      <style>
+        body { font-family: system-ui, sans-serif; max-width: 400px; margin: 80px auto; padding: 0 20px; }
+        h1 { font-size: 1.5rem; }
+        input { padding: 10px; width: 100%; box-sizing: border-box; margin: 8px 0 12px; }
+        button { padding: 10px 24px; background: #4285f4; color: white; border: 0; border-radius: 6px; cursor: pointer; }
+        .msg { padding: 10px; background: #fce4ec; border-radius: 6px; margin-bottom: 12px; }
+      </style>
+    </head>
+    <body>
+      <h1>Gmail MCP Admin Login</h1>
+      ${message ? `<div class="msg">${escapeHtml(message)}</div>` : ""}
+      <form method="POST" action="/setup/login" autocomplete="off">
+        <label for="password">Admin password</label>
+        <input id="password" type="password" name="password" autocomplete="current-password" required autofocus />
+        <button type="submit">Login</button>
+      </form>
+    </body>
+    </html>
+  `);
+}
+
+app.use(["/setup", "/oauth"], (_req, res, next) => {
+  res.setHeader("Cache-Control", "no-store, max-age=0");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+  );
+  if (SECURE_SERVER) {
+    res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  }
+  next();
+});
+
+// Strip legacy password-bearing links without reading or reusing the password.
+app.use(["/setup", "/oauth"], (req, res, next) => {
+  if (req.query.key !== undefined) {
+    res.redirect(303, "/setup");
+    return;
+  }
+  next();
+});
+
+function requireAdmin(req: Request, res: Response, next: NextFunction): void {
+  const session = adminAuth.readSession(req.headers.cookie);
+  if (!session) {
+    if (req.method === "GET" && req.path === "/setup") {
+      sendLoginPage(res);
+    } else {
+      res.status(401).send("Unauthorized");
+    }
+    return;
+  }
+  res.locals.adminSession = session;
+  next();
+}
+
+function requireCsrf(req: Request, res: Response, next: NextFunction): void {
+  const session = res.locals.adminSession as AdminSession | undefined;
+  if (!session || !adminAuth.verifyCsrf(session, req.body.csrfToken)) {
+    res.status(403).send("Invalid request token");
     return;
   }
   next();
 }
 
+app.post("/setup/login", (req: Request, res: Response) => {
+  const clientId = req.ip || req.socket.remoteAddress || "unknown";
+  if (adminAuth.isLoginBlocked(clientId)) {
+    res.setHeader("Retry-After", "900");
+    sendLoginPage(res, 429, "Too many failed attempts. Try again later.");
+    return;
+  }
+
+  if (!adminAuth.verifyPassword(req.body.password)) {
+    adminAuth.recordLoginFailure(clientId);
+    sendLoginPage(res, 401, "Invalid password.");
+    return;
+  }
+
+  adminAuth.clearLoginFailures(clientId);
+  const { token } = adminAuth.createSession();
+  res.cookie(adminAuth.cookieName, token, adminAuth.sessionCookieOptions);
+  res.redirect(303, "/setup");
+});
+
+app.post("/setup/logout", requireAdmin, requireCsrf, (_req, res) => {
+  const { maxAge: _maxAge, ...clearOptions } = adminAuth.sessionCookieOptions;
+  res.clearCookie(adminAuth.cookieName, clearOptions);
+  res.redirect(303, "/setup");
+});
+
 // ---------------------------------------------------------------------------
 // Setup page — manage connected Gmail accounts
 // ---------------------------------------------------------------------------
 
-app.get("/setup", requireAdmin, (_req: Request, res: Response) => {
+app.get("/setup", requireAdmin, (req: Request, res: Response) => {
   const accounts = tokenStore.listAccounts();
-  const key = _req.query.key as string;
-  const message = _req.query.message as string | undefined;
+  const message = req.query.message as string | undefined;
+  const session = res.locals.adminSession as AdminSession;
+  const csrfToken = escapeHtml(session.csrfToken);
 
   const accountRows = accounts.length > 0
     ? accounts
         .map(
           (a) => `
         <tr>
-          <td>${a.email}</td>
-          <td>${new Date(a.addedAt).toLocaleDateString()}</td>
+          <td>${escapeHtml(a.email)}</td>
+          <td>${escapeHtml(new Date(a.addedAt).toLocaleDateString())}</td>
           <td>
-            <form method="POST" action="/setup/remove?key=${encodeURIComponent(key)}" style="display:inline">
-              <input type="hidden" name="email" value="${a.email}" />
-              <button type="submit" onclick="return confirm('Remove ${a.email}?')" style="color:red;background:none;border:1px solid red;padding:4px 12px;cursor:pointer">Remove</button>
+            <form method="POST" action="/setup/remove" style="display:inline">
+              <input type="hidden" name="csrfToken" value="${csrfToken}" />
+              <input type="hidden" name="email" value="${escapeHtml(a.email)}" />
+              <button type="submit" style="color:red;background:none;border:1px solid red;padding:4px 12px;cursor:pointer">Remove</button>
             </form>
           </td>
         </tr>`
@@ -424,7 +534,7 @@ app.get("/setup", requireAdmin, (_req: Request, res: Response) => {
     <!DOCTYPE html>
     <html>
     <head>
-      <title>Gmail MCP — Setup</title>
+      <title>Gmail MCP - Setup</title>
       <style>
         body { font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; }
         h1 { font-size: 1.5rem; }
@@ -438,18 +548,25 @@ app.get("/setup", requireAdmin, (_req: Request, res: Response) => {
       </style>
     </head>
     <body>
-      <h1>Gmail MCP Server — Setup</h1>
-      ${message ? `<div class="msg">${message}</div>` : ""}
+      <h1>Gmail MCP Server - Setup</h1>
+      ${message ? `<div class="msg">${escapeHtml(message)}</div>` : ""}
       <table>
         <thead><tr><th>Account</th><th>Added</th><th></th></tr></thead>
         <tbody>${accountRows}</tbody>
       </table>
-      <a class="btn" href="/oauth/start?key=${encodeURIComponent(key)}">+ Add Gmail Account</a>
+      <form method="POST" action="/oauth/start" style="display:inline">
+        <input type="hidden" name="csrfToken" value="${csrfToken}" />
+        <button class="btn" type="submit" style="border:0;cursor:pointer">+ Add Gmail Account</button>
+      </form>
+      <form method="POST" action="/setup/logout" style="display:inline;margin-left:8px">
+        <input type="hidden" name="csrfToken" value="${csrfToken}" />
+        <button type="submit" style="padding:10px 18px;background:white;border:1px solid #aaa;border-radius:6px;cursor:pointer">Log out</button>
+      </form>
       ${accounts.length > 0 ? `
       <div style="margin-top:24px;padding:16px;background:#fff3cd;border-radius:6px">
         <strong>Important:</strong> After adding/removing accounts, copy the value below and paste it as the <code>TOKENS_DATA</code> environment variable in Railway. This ensures accounts survive redeploys.
         <div style="margin-top:8px">
-          <textarea readonly style="width:100%;height:60px;font-family:monospace;font-size:11px;box-sizing:border-box" onclick="this.select()">${tokenStore.getTokensDataForExport()}</textarea>
+          <textarea readonly style="width:100%;height:60px;font-family:monospace;font-size:11px;box-sizing:border-box">${escapeHtml(tokenStore.getTokensDataForExport())}</textarea>
         </div>
       </div>
       ` : ""}
@@ -463,15 +580,14 @@ app.get("/setup", requireAdmin, (_req: Request, res: Response) => {
   `);
 });
 
-app.post("/setup/remove", requireAdmin, (req: Request, res: Response) => {
+app.post("/setup/remove", requireAdmin, requireCsrf, (req: Request, res: Response) => {
   const email = req.body.email;
-  const key = req.query.key as string;
 
   if (email && tokenStore.hasAccount(email)) {
     tokenStore.removeAccount(email);
-    res.redirect(`/setup?key=${encodeURIComponent(key)}&message=${encodeURIComponent(`Removed ${email}`)}`);
+    res.redirect(303, setupUrl(`Removed ${email}`));
   } else {
-    res.redirect(`/setup?key=${encodeURIComponent(key)}&message=${encodeURIComponent("Account not found")}`);
+    res.redirect(303, setupUrl("Account not found"));
   }
 });
 
@@ -479,40 +595,42 @@ app.post("/setup/remove", requireAdmin, (req: Request, res: Response) => {
 // OAuth flow — server-managed Google auth
 // ---------------------------------------------------------------------------
 
-app.get("/oauth/start", (req: Request, res: Response) => {
-  const key = req.query.key as string;
-  if (key !== ADMIN_PASSWORD) {
-    res.status(401).send("Unauthorized");
-    return;
-  }
-
+app.post("/oauth/start", requireAdmin, requireCsrf, (_req: Request, res: Response) => {
+  const session = res.locals.adminSession as AdminSession;
+  const state = adminAuth.createOAuthState(session);
   const oauth2 = makeOAuth2Client();
   const url = oauth2.generateAuthUrl({
     access_type: "offline",
     prompt: "consent",
     scope: SCOPES,
-    state: key, // pass admin key through OAuth flow
+    state,
   });
 
   res.redirect(url);
 });
 
-app.get("/oauth/callback", async (req: Request, res: Response) => {
+app.get("/oauth/start", (_req: Request, res: Response) => {
+  res.redirect(303, "/setup");
+});
+
+app.get("/oauth/callback", requireAdmin, async (req: Request, res: Response) => {
   const code = req.query.code as string;
   const state = req.query.state as string;
   const error = req.query.error as string;
+  const session = res.locals.adminSession as AdminSession;
+
+  if (!adminAuth.consumeOAuthState(state, session)) {
+    res.status(400).send("Invalid or expired OAuth state. Return to /setup and try again.");
+    return;
+  }
 
   if (error) {
-    res.redirect(
-      `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent(`OAuth error: ${error}`)}`
-    );
+    res.redirect(303, setupUrl(`OAuth error: ${error}`));
     return;
   }
 
   if (!code) {
-    res.redirect(
-      `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent("No authorization code received")}`
-    );
+    res.redirect(303, setupUrl("No authorization code received"));
     return;
   }
 
@@ -521,9 +639,7 @@ app.get("/oauth/callback", async (req: Request, res: Response) => {
     const { tokens } = await oauth2.getToken(code);
 
     if (!tokens.refresh_token) {
-      res.redirect(
-        `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent("No refresh token received. Try removing the app from your Google account permissions and re-adding.")}`
-      );
+      res.redirect(303, setupUrl("No refresh token received. Try removing the app from your Google account permissions and re-adding."));
       return;
     }
 
@@ -534,22 +650,16 @@ app.get("/oauth/callback", async (req: Request, res: Response) => {
     const email = userInfo.data.email;
 
     if (!email) {
-      res.redirect(
-        `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent("Could not determine email address")}`
-      );
+      res.redirect(303, setupUrl("Could not determine email address"));
       return;
     }
 
     tokenStore.addAccount(email, tokens.refresh_token);
 
-    res.redirect(
-      `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent(`Successfully connected ${email}`)}`
-    );
-  } catch (err: any) {
-    console.error("[oauth/callback] Error:", err);
-    res.redirect(
-      `/setup?key=${encodeURIComponent(state)}&message=${encodeURIComponent(`Error: ${err.message}`)}`
-    );
+    res.redirect(303, setupUrl(`Successfully connected ${email}`));
+  } catch {
+    console.error("[oauth/callback] OAuth exchange failed");
+    res.redirect(303, setupUrl("OAuth authorization failed. Please try again."));
   }
 });
 
@@ -616,10 +726,12 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 // Start
 // ---------------------------------------------------------------------------
 
-app.listen(PORT, () => {
-  console.log(`Gmail MCP server listening on port ${PORT}`);
-  console.log(`  MCP endpoint:  ${SERVER_URL}/mcp`);
-  console.log(`  Setup page:    ${SERVER_URL}/setup`);
-  console.log(`  Health check:  ${SERVER_URL}/health`);
-  console.log(`  Accounts:      ${tokenStore.size}`);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  app.listen(PORT, () => {
+    console.log(`Gmail MCP server listening on port ${PORT}`);
+    console.log(`  MCP endpoint:  ${SERVER_URL}/mcp`);
+    console.log(`  Setup page:    ${SERVER_URL}/setup`);
+    console.log(`  Health check:  ${SERVER_URL}/health`);
+    console.log(`  Accounts:      ${tokenStore.size}`);
+  });
+}
