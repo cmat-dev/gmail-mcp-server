@@ -14,7 +14,8 @@ import { join } from "node:path";
 // 1. File on disk (works if volume is mounted or running locally)
 // 2. TOKENS_DATA env var (base64-encoded JSON — survives Railway redeploys)
 //
-// On save: writes to both file AND logs the env var value so you can copy it.
+// On save: writes to the local data file. The setup page provides an authenticated
+// export for updating TOKENS_DATA without exposing token material in server logs.
 // On load: tries file first, falls back to TOKENS_DATA env var.
 // ---------------------------------------------------------------------------
 
@@ -139,11 +140,6 @@ export class TokenStore {
 
   private save(): void {
     this.saveToFile();
-
-    // Also output the base64-encoded data for the TOKENS_DATA env var
-    const data: StoreData = { accounts: Array.from(this.accounts.values()) };
-    const encoded = Buffer.from(JSON.stringify(data)).toString("base64");
-    console.log(`[token-store] TOKENS_DATA=${encoded}`);
   }
 
   /** Returns base64-encoded token data for copying to env var */

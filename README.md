@@ -105,6 +105,7 @@ This Gmail MCP server turns any MCP-compatible AI client into a full-featured em
 | `GOOGLE_CLIENT_SECRET` | Your OAuth Client Secret |
 | `ENCRYPTION_KEY` | Any random string (32+ characters) |
 | `ADMIN_PASSWORD` | Password for the setup page |
+| `SESSION_SECRET` | Optional separate random string (32+ characters) for signing admin sessions; falls back to `ENCRYPTION_KEY` |
 | `SERVER_URL` | Your Railway app URL (e.g., `https://your-app.railway.app`) |
 | `PORT` | `3000` |
 
@@ -260,6 +261,8 @@ Gmail API (per-account OAuth tokens)
 - **Minimal scopes** using only `gmail.readonly` and `gmail.modify`
 - **No passwords stored.** Your Gmail password never touches the server
 - **Password-protected setup.** The `/setup` page requires admin authentication
+- **Hardened admin sessions.** The admin password is submitted by POST and exchanged for a short-lived, signed `HttpOnly`, `Secure`, `SameSite=Lax` cookie. It is never placed in a URL or OAuth state.
+- **OAuth CSRF protection.** OAuth state values are random, short-lived, single-use, and bound to the initiating admin session.
 - **Revocable anytime** from [Google Account Permissions](https://myaccount.google.com/permissions)
 
 ---
