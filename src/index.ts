@@ -13,6 +13,9 @@ import { AdminAuth, AdminSession } from "./admin-auth.js";
 // ---------------------------------------------------------------------------
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
+// Bind to loopback by default so a reverse proxy (Caddy, Tailscale serve) is the only way in.
+// Container images set HOST=0.0.0.0 (see Dockerfile).
+const HOST = process.env.HOST || "127.0.0.1";
 const SERVER_URL = process.env.SERVER_URL || `http://localhost:${PORT}`;
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID!;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET!;
@@ -435,7 +438,7 @@ app.use(["/setup", "/oauth"], (_req, res, next) => {
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader(
     "Content-Security-Policy",
-    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https://accounts.google.com; base-uri 'none'; frame-ancestors 'none'"
   );
   if (SECURE_SERVER) {
     res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
@@ -727,8 +730,8 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 // ---------------------------------------------------------------------------
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  app.listen(PORT, () => {
-    console.log(`Gmail MCP server listening on port ${PORT}`);
+  app.listen(PORT, HOST, () => {
+    console.log(`Gmail MCP server listening on ${HOST}:${PORT}`);
     console.log(`  MCP endpoint:  ${SERVER_URL}/mcp`);
     console.log(`  Setup page:    ${SERVER_URL}/setup`);
     console.log(`  Health check:  ${SERVER_URL}/health`);
