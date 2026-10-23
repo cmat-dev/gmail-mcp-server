@@ -57,6 +57,10 @@ test("login uses POST and returns a hardened session cookie", async () => {
   assert.doesNotMatch(loginHtml, /name="key"/);
   assert.equal(loginPage.headers.get("cache-control"), "no-store, max-age=0");
   assert.match(loginPage.headers.get("content-security-policy") ?? "", /default-src 'none'/);
+  assert.match(
+    loginPage.headers.get("content-security-policy") ?? "",
+    /form-action 'self' https:\/\/accounts\.google\.com;/
+  );
 
   const response = await fetch(`${baseUrl}/setup/login`, {
     method: "POST",
