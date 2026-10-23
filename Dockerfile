@@ -17,6 +17,7 @@ RUN npm prune --omit=dev
 RUN mkdir -p /app/data
 
 ENV NODE_ENV=production
+ENV HOST=0.0.0.0
 ENV DATA_DIR=/app/data
 
 EXPOSE 3000
